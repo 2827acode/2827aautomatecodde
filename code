@@ -1,0 +1,583 @@
+#include "main.h"
+#include "lemlib/api.hpp" // IWYU pragma: keep
+#include "lemlib/asset.hpp"
+#include "lemlib/chassis/chassis.hpp"
+#include "pros/abstract_motor.hpp"
+#include "pros/adi.hpp"
+#include "pros/misc.h"
+#include "pros/motor_group.hpp"
+#include "pros/motors.h"
+#include "pros/rotation.hpp"
+#include "pros/rtos.h"
+#include "pros/rtos.hpp"
+#include <cmath>
+#include <cstdio>
+#include <ctime>
+#include <math.h>
+
+// SETS UP MOVEMENT AND MOTOR/MOTORGROUPS, PNEUMATICS, AND AUTON MOVEMENT
+pros::Controller master(pros::E_CONTROLLER_MASTER);
+pros::MotorGroup left_mg({-20,-12,-3}, pros::MotorGearset::blue);
+pros::MotorGroup right_mg({5,11,13}, pros::MotorGearset::blue);
+pros::MotorGroup IntakeAndOuttake({-1}, pros::MotorGearset::red);
+pros::MotorGroup BottomGoalOutake({1}, pros::MotorGearset::red);
+pros::MotorGroup DoubleBar({14, -15}, pros::MotorGearset::green);
+pros::Motor CascadeUp(16, pros::MotorGearset::red);
+pros::Motor ClawArm(17, pros::MotorGearset::green);
+
+pros::Imu imu(19);
+
+bool claw = false;
+bool macro_started = false;
+bool macro_is_running = false; // Controls whether driver sticks or macro has the claw
+bool is_l1_macro_running = false; // --- NEW: Prevents task spamming and driver hold fighting ---
+
+// Semi-autonomous lift tracking variables
+bool auton_lift_active = false;
+double auton_lift_target = 0.0;
+int auton_lift_max_velocity = 70;
+bool is_cascade_moving_bg = false; // --- FIXED: Prevents driver loop from overriding background Cascade movements ---
+
+pros::ADIDigitalOut air('H', claw);
+
+volatile bool clawArmStallDone = false;
+
+lemlib::ExpoDriveCurve throttle_curve(3, // joystick deadband out of 127
+                                     10, // minimum output where drivetrain will move out of 127
+                                     1.019 // expo curve gain
+);
+
+// input curve for steer input during driver control
+lemlib::ExpoDriveCurve steer_curve(3, // joystick deadband out of 127
+                                  10, // minimum output where drivetrain will move out of 127
+                                  1 // expo curve gain
+);
+
+lemlib::Drivetrain drivetrain(&right_mg, // left motor group
+                              &left_mg, // right motor group
+                              11.4, // 10 inch track width
+                              lemlib::Omniwheel::NEW_275, // using new 4" omnis
+                              450, // drivetrain rpm is 360
+                              2 // horizontal drift is 2 (for now)
+);
+
+lemlib::OdomSensors sensors(nullptr, // vertical tracking wheel 1, set to null
+                            nullptr, // vertical tracking wheel 2, set to nullptr as we are using IMEs
+                            nullptr, // horizontal tracking wheel 1
+                            nullptr, // horizontal tracking wheel 2, set to nullptr as we don't have a second one
+                            &imu// inertial sensor
+);
+
+// lateral PID controller
+lemlib::ControllerSettings lateral_controller(4, // proportional gain (kP)
+                                              0, // integral gain (kI)
+                                              15, // derivative gain (kD)
+                                              3, // anti windup
+                                              1, // small error range, in inches
+                                              100, // small error range timeout, in milliseconds
+                                              3, // large error range, in inches
+                                              500, // large error range timeout, in milliseconds
+                                              127 // maximum acceleration (slew)
+);
+
+// angular PID controller
+lemlib::ControllerSettings angular_controller(4, // proportional gain (kP)
+                                              0, // integral gain (kI)
+                                              15, // derivative gain (kD)
+                                              0, // anti windup
+                                              0, // small error range, in inches
+                                              0, // small error range timeout, in milliseconds
+                                              0, // large error range, in inches
+                                              0, // large error range timeout, in milliseconds
+                                              0 // maximum acceleration (slew)
+);
+
+// create the chassis
+lemlib::Chassis chassis(drivetrain, // drivetrain settings
+                        lateral_controller, // lateral PID settings
+                        angular_controller, // angular PID settings
+                        sensors // odometry sensors
+);
+
+class Timer {
+private:
+    uint32_t start_time;
+    uint32_t duration;
+
+public:
+    Timer(uint32_t wait_time_ms) {
+        start_time = pros::millis();
+        duration = wait_time_ms;
+    }
+
+    bool is_running() {
+        return (pros::millis() - start_time) < duration;
+    }
+};
+
+const double kp = 1;
+void pid_brake_lift() {
+    double target = DoubleBar.get_position();
+    while (true) {
+        double error = target - DoubleBar.get_position();
+        DoubleBar.move(error * kp);
+        pros::delay(20);
+    }
+}
+
+const double LIFT_KP = .1;  // Core muscle strength
+const double LIFT_KD = 1;   // Dampening to prevent bouncing/shaking
+
+double lift_target_pos = 0;
+double lift_last_error = 0;
+bool lift_is_holding = false;
+bool should_hold_lift = false;
+double lift_hold_target = 0;
+
+void LiftBrake() {
+    if (!lift_is_holding) {
+        lift_target_pos = DoubleBar.get_position();
+        lift_last_error = 0; 
+        lift_is_holding = true;
+    }
+
+    double current_pos = DoubleBar.get_position();
+    double error = lift_target_pos - current_pos;
+    double derivative = error - lift_last_error;
+    lift_last_error = error; 
+
+    double total_voltage = (error * LIFT_KP) + (derivative * LIFT_KD);
+
+    if (total_voltage > 70) total_voltage = 70;
+    if (total_voltage < -70) total_voltage = -70;
+
+    DoubleBar.move(total_voltage);
+}
+
+void lift_hold_task_fn(void* param) {
+    const double kp = 1.0; 
+    while (true) {
+        if (should_hold_lift) {
+            double error = lift_hold_target - DoubleBar.get_position();
+            DoubleBar.move(error * kp);
+        }
+        pros::delay(20); 
+    }
+}
+
+void move_until_stalled_ClawArm(int velocity) {
+    ClawArm.move(velocity);
+    Timer timer(1000); 
+    int stall_counter = 0;
+
+    while (timer.is_running()) {
+        double actual_velocity = ClawArm.get_actual_velocity();
+        int current_draw = ClawArm.get_current_draw();
+
+        if (std::abs(actual_velocity) < 10 && current_draw > 1000) { 
+            stall_counter++;
+        } else {
+            stall_counter = 0;
+        }
+
+        if (stall_counter > 5) {
+            break;
+        }
+
+        pros::delay(20);
+    }
+    ClawArm.brake();
+    clawArmStallDone = true;
+}
+
+void claw_arm_task_wrapper(void* param) {
+    int speed = (int)(intptr_t)param;
+    move_until_stalled_ClawArm(speed);
+}
+
+void move_until_stalled_DoubleBar(int velocity) {
+    DoubleBar.move(velocity);
+    Timer timer(3000); 
+    int stall_counter = 0;
+
+    while (timer.is_running()) {
+        double actual_velocity = DoubleBar.get_actual_velocity();
+        int current_draw = DoubleBar.get_current_draw();
+
+        if (std::abs(actual_velocity) < 10 && current_draw > 1000) {
+            stall_counter++;
+        } else {
+            stall_counter = 0;
+        }
+
+        if (stall_counter > 5) {
+            break;
+        }
+
+        pros::delay(20);
+    }
+    DoubleBar.brake();
+}
+
+// Constants for your claw setup
+const double CLAW_GEAR_RATIO = 4.722; 
+const double CLAW_GEAR_RATIO2 = 1.5; 
+const double CLAW_CLEARANCE = 5.0 * CLAW_GEAR_RATIO; 
+const double CLAW_CLEARANCE2 = 5.0 * CLAW_GEAR_RATIO2; 
+const double hold_kP = 1; 
+
+void ClawMove(double target_claw_angle, int speed, int timeout_ms) {
+    double motor_target = target_claw_angle * CLAW_GEAR_RATIO; 
+    ClawArm.move_absolute(motor_target, speed);
+    
+    Timer claw_wait(timeout_ms); 
+    while (claw_wait.is_running()) {
+        double current_motor_pos = ClawArm.get_position();
+        double error = std::abs(motor_target - current_motor_pos);
+        if (error <= (12.0 * CLAW_GEAR_RATIO)) { 
+            break; 
+        }
+        pros::delay(20); 
+    }   
+    ClawArm.move(0);
+    ClawArm.set_brake_mode(pros::E_MOTOR_BRAKE_HOLD);
+}
+
+void CascadeMove(double target_cascade_move, int speed, int timeout_ms) {
+    double motor_target = target_cascade_move; 
+    CascadeUp.move_absolute(motor_target, speed);
+    
+    Timer claw_wait(timeout_ms); 
+    while (claw_wait.is_running()) {
+        double current_motor_pos = CascadeUp.get_position();
+        double error = std::abs(motor_target - current_motor_pos);
+        if (error <= 15.0) { 
+            break; 
+        }
+        pros::delay(20); 
+    }   
+    CascadeUp.move(0);
+    CascadeUp.set_brake_mode(pros::E_MOTOR_BRAKE_HOLD);
+}
+
+void DoubleBarMove(double target_double_bar, int speed, int timeout_ms) {
+    double motor_target = target_double_bar; 
+    DoubleBar.move_absolute(motor_target, speed);
+    
+    Timer claw_wait(timeout_ms); 
+    while (claw_wait.is_running()) {
+        double current_motor_pos = DoubleBar.get_position();
+        double error = std::abs(motor_target - current_motor_pos);
+        if (error <= 15.0) {
+            break; 
+        }
+        pros::delay(20); 
+    }   
+    DoubleBar.move(0);
+    DoubleBar.set_brake_mode(pros::E_MOTOR_BRAKE_HOLD);
+}
+
+void execute_macro_logic() {
+    macro_is_running = true; 
+    clawArmStallDone = false;
+    air.set_value(false);
+    pros::delay(20);
+    claw = false;
+
+    // 1. Launch the claw stall helper at speed 50 to prevent over-current drops
+    CascadeUp.set_brake_mode(pros::E_MOTOR_BRAKE_COAST);
+    CascadeUp.brake();
+    CascadeMove(0, 200, 2000);
+    CascadeUp.brake();
+    pros::Task claw_task(claw_arm_task_wrapper, (void*)50, "ClawArm Task");
+
+    // 2. Start moving the lift down
+    move_until_stalled_DoubleBar(-45);
+
+    // 3. Safety Timeout Loop (Max 2.5 seconds)
+    int timeout_counter = 0;
+    while (!clawArmStallDone && timeout_counter < 250) {
+        pros::delay(10);
+        timeout_counter++;
+    }
+
+    // 4. Reset positions
+    ClawArm.tare_position();
+    DoubleBar.tare_position();
+    pros::delay(20);
+
+    // 5. Move to driver layout zero (-100)
+    ClawMove(-95, 50, 1000); 
+    ClawArm.tare_position();
+    air.set_value(true);
+    pros::delay(20);
+    claw = true;
+
+    lift_is_holding = false;
+
+    // 6. Release control back to driver controls safely
+    macro_is_running = false; 
+}
+
+void background_lift_task(void* param) {
+    const double LEVELING_GAIN = 1.1; 
+    const double CLAW_KP = 0.4;       
+    const double CLAW_KD = 0.1; 
+    double claw_last_error = 0;
+
+    uint32_t start_time = pros::millis();
+    const uint32_t MAX_RUN_TIME_MS = 3000; 
+
+    int stall_counter = 0;
+
+    while (auton_lift_active) {
+        if ((pros::millis() - start_time) > MAX_RUN_TIME_MS) {
+            break;
+        }
+
+        double lift_motor_ticks = DoubleBar.get_position();
+        double lift_error = auton_lift_target - lift_motor_ticks;
+
+        if (std::abs(lift_error) < 15) {
+            break;
+        }
+
+        // Mechanical Hard-Stop Stall Protection
+        if (std::abs(DoubleBar.get_actual_velocity()) < 5 && std::abs(lift_error) > 20) {
+            stall_counter++;
+        } else {
+            stall_counter = 0;
+        }
+
+        if (stall_counter > 5) {
+            break;
+        }
+
+        double lift_power = lift_error * 0.4;
+        if (lift_power > auton_lift_max_velocity) lift_power = auton_lift_max_velocity;
+        if (lift_power < -auton_lift_max_velocity) lift_power = -auton_lift_max_velocity;
+        DoubleBar.move(lift_power);
+
+        // CLEAN LINEAR LEVEL TRACKING
+        double claw_target_ticks = -lift_motor_ticks * 0.3 * LEVELING_GAIN;
+
+        double claw_error = claw_target_ticks - ClawArm.get_position();
+        double claw_derivative = claw_error - claw_last_error;
+        claw_last_error = claw_error; 
+        double claw_power = (claw_error * CLAW_KP) + (claw_derivative * CLAW_KD);
+        ClawArm.move(claw_power);
+
+        pros::delay(20);
+    }
+    
+    DoubleBar.move(0); 
+    auton_lift_active = false; 
+    lift_is_holding = false; 
+}
+
+void MoveArmLevelBackground(double target_angle, int velocity) {
+    auton_lift_target = target_angle;
+    auton_lift_max_velocity = velocity;
+    lift_is_holding = false;
+
+    if (!auton_lift_active) {
+        auton_lift_active = true;
+        pros::Task lift_bg_thread(background_lift_task, nullptr, "Bg Lift Task");
+    }
+}
+
+void on_center_button() {
+    static bool pressed = false;
+    pressed = !pressed;
+    if (pressed) {
+        pros::lcd::set_text(2, "I was pressed!");
+    } else {
+        pros::lcd::clear_line(2);
+    }
+}
+
+void initialize() {
+    pros::lcd::initialize(); 
+    chassis.calibrate(); 
+    CascadeUp.set_brake_mode(pros::E_MOTOR_BRAKE_HOLD);
+
+    pros::Task screen_task([&]() {
+        while (true) {
+            pros::lcd::print(0, "X: %f", chassis.getPose().x); 
+            pros::lcd::print(1, "Y: %f", chassis.getPose().y ); 
+            pros::lcd::print(2, "Theta: %f",chassis.getPose().theta);
+            pros::delay(50);
+        }
+    });
+}
+
+void disabled() {}
+void competition_initialize() {}
+
+void autonomous() {
+    chassis.setPose(0, 0, 0);
+    chassis.moveToPoint(0, -20, 2000, {.forwards = false}, false);
+    DoubleBar.set_brake_mode(pros::E_MOTOR_BRAKE_HOLD);
+    DoubleBar.move(45);
+    pros::delay(2000);
+    DoubleBar.brake();
+    chassis.moveToPoint(0, 3, 1000, {.maxSpeed = 75, .minSpeed =45});
+    chassis.moveToPoint(0, -10, 1000, {.forwards = false});
+    chassis.moveToPoint(0, 3, 1000, {.maxSpeed = 75, .minSpeed = 45});
+    chassis.moveToPoint(0, -20, 1000, {.forwards = false}, false);
+    DoubleBar.set_brake_mode(pros::E_MOTOR_BRAKE_COAST);
+    DoubleBar.move(-45);
+
+    pros::delay(1000);
+    DoubleBar.move(0);
+}
+
+void opcontrol() {
+    chassis.cancelAllMotions();
+    chassis.setPose(0, 0, 0);
+    bool held = false;
+    
+    const double LEVELING_GAIN = .9;
+    const double CLAW_KP = 0.4;
+    const double CLAW_KD = 0.1; 
+    double claw_last_error = 0; 
+
+    while (true) {
+        int dir = master.get_analog(ANALOG_LEFT_Y);
+        int turn = master.get_analog(ANALOG_RIGHT_X);
+
+        right_mg.move(dir + turn);
+        left_mg.move(dir - turn);
+
+
+        if (master.get_digital_new_press(DIGITAL_X)) {
+            pros::Task macro_task([](void* param) {
+                execute_macro_logic();
+            }, nullptr, "X Macro");
+        }
+
+
+        if (master.get_digital_new_press(DIGITAL_R2)) {
+            auton_lift_active = false; 
+            pros::delay(20);
+            MoveArmLevelBackground(1200.0, 80);
+        }
+
+
+        if (master.get_digital_new_press(DIGITAL_L1) && !is_l1_macro_running) {
+            is_l1_macro_running = true; 
+            auton_lift_active = false; 
+            lift_is_holding = false; 
+
+            pros::Task l1_sequence_task([]() {
+                CascadeUp.set_brake_mode(pros::E_MOTOR_BRAKE_HOLD);
+                pros::delay(20);
+                
+                DoubleBarMove(0, 100, 1000);
+
+                CascadeMove(6000, 200, 2000);
+
+                CascadeUp.brake();
+
+                lift_is_holding = false; 
+                is_l1_macro_running = false; 
+            });
+        }
+
+        if (master.get_digital_new_press(DIGITAL_R1)) {
+            if (claw == false) {
+                
+                air.set_value(true);
+                pros::delay(20);
+                claw = true;
+                if (CascadeUp.get_position() < 1250);
+                    is_cascade_moving_bg = true;
+                    pros::Task cascade_bg_task([]() {
+                    CascadeMove(0, 200, 1000);
+                    is_cascade_moving_bg = false;
+                });
+            } else {
+                air.set_value(false);
+                pros::delay(20);
+                claw = false;
+                if (CascadeUp.get_position() < 50);
+                    is_cascade_moving_bg = true;
+                    pros::Task cascade_bg_task([]() {
+                    CascadeMove(750, 200, 1000);
+                    is_cascade_moving_bg = false;
+                });
+            } 
+        }
+
+
+        if (!macro_is_running) {
+            double lift_motor_ticks = DoubleBar.get_position();
+            
+            double claw_target_ticks = -lift_motor_ticks * 0.3 * LEVELING_GAIN;
+
+            double claw_error = claw_target_ticks - ClawArm.get_position();
+            double claw_derivative = claw_error - claw_last_error;
+            claw_last_error = claw_error; 
+            double claw_power = (claw_error * CLAW_KP) + (claw_derivative * CLAW_KD);
+
+            // Always track claw leveling
+            ClawArm.move(claw_power); 
+
+            if (master.get_digital(DIGITAL_Y)) {
+                auton_lift_active = false; 
+                lift_is_holding = false; 
+                DoubleBar.move(50); 
+            } 
+            
+            else if (master.get_digital(DIGITAL_RIGHT)) {
+                auton_lift_active = false; 
+                lift_is_holding = false; 
+                DoubleBar.move(-50); 
+            }
+
+            else if (master.get_digital_new_press(DIGITAL_L2) && !is_cascade_moving_bg) {
+                is_cascade_moving_bg = true;
+
+                pros::Task cascade_bg_task([](void* param) {
+                    CascadeMove(0, 200, 2000); 
+                    
+                    is_cascade_moving_bg = false; 
+                }, nullptr, "L2 Cascade Task");
+            }
+            else if (master.get_digital(DIGITAL_UP)) {
+                auton_lift_active = false;
+                CascadeUp.move(127);
+            }
+            else if (master.get_digital(DIGITAL_DOWN)) {
+                auton_lift_active = false;
+                CascadeUp.move(-127);
+            }
+
+            else if (!auton_lift_active && !is_l1_macro_running) {
+                if (lift_is_holding == false) {
+                    lift_target_pos = DoubleBar.get_position();
+                    lift_last_error = 0;                        
+                    lift_is_holding = true;                     
+                }
+
+                if (!is_cascade_moving_bg) {
+                    if (!master.get_digital(DIGITAL_UP) && !master.get_digital(DIGITAL_DOWN)) {
+                        CascadeUp.move(0);
+                        CascadeUp.brake();
+                    }
+                }
+
+                LiftBrake();
+                IntakeAndOuttake.move(0);
+            }
+            else {
+                IntakeAndOuttake.move(0);
+            }
+        }
+        else {
+            IntakeAndOuttake.move(0);
+        }
+
+        pros::delay(20);
+    }
+}
